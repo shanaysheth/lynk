@@ -87,7 +87,6 @@ def route(msg, sender_id):
     if message_type == "BROADCAST":
         # Send to every device except the sender
         with lock:
-            # Build a list of sockets for everyone except the sender
             target_sockets = [
                 sock for did, sock in devices.items()
                 if did != sender_id
@@ -98,8 +97,13 @@ def route(msg, sender_id):
     elif message_type == "ROOM":
         room_name = msg.get("room")
         with lock:
-            # Get the list of device IDs in this room
             members = rooms.get(room_name, [])
+
+            # Only deliver if the sender is actually in the room
+            # This prevents a client who left from still sending to the room
+            if sender_id not in members:
+                return
+
             # Build list of sockets, excluding the sender
             target_sockets = [
                 devices[did] for did in members
