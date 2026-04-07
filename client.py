@@ -9,6 +9,7 @@ import threading   # For running the receive loop in the background
 import json        # For encoding/decoding messages
 import time        # For a small startup delay
 import os          # For checking file paths and sizes
+import base64      # For encoding file bytes into text so they fit in JSON
 
 # ─── Configuration ────────────────────────────────────────
 
@@ -17,9 +18,6 @@ UDP_PORT    = 55000  # UDP port used for discovery beacons
 BUFFER_SIZE = 4096   # How many bytes we read at a time from the socket
 
 # ─── Session State ────────────────────────────────────────
-# These variables track our current session.
-# device_id is assigned by the server when we connect.
-# current_room is the room we're currently active in.
 
 device_id    = None
 current_room = "general"
@@ -33,19 +31,15 @@ def discover_server(timeout=3):
     If we receive one within the timeout, we return those details.
     If not, we return None so the user can enter the IP manually.
     """
-    # Create a UDP socket for receiving broadcasts
     udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-    # SO_BROADCAST allows receiving broadcast packets
     udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-
-    udp_sock.settimeout(timeout)  # Stop waiting after 'timeout' seconds
-    udp_sock.bind(("", UDP_PORT)) # Listen on the UDP discovery port
+    udp_sock.settimeout(timeout)
+    udp_sock.bind(("", UDP_PORT))
 
     print("[Lynk] Searching for server on local network...")
 
     try:
-        data, _ = udp_sock.recvfrom(1024)  # Wait for a broadcast packet
+        data, _ = udp_sock.recvfrom(1024)
         msg = json.loads(data.decode())
 
         if msg.get("type") == "DISCOVER":
@@ -55,12 +49,12 @@ def discover_server(timeout=3):
             return ip, port
 
     except socket.timeout:
-        pass  # No beacon received within the timeout
+        pass
 
     finally:
         udp_sock.close()
 
-    return None, None  # Signal that discovery failed
+    return None, None
 
 # ─── Sending Messages ─────────────────────────────────────
 
@@ -74,7 +68,7 @@ def send_msg(sock, msg: dict):
         data = json.dumps(msg) + "\n"
         sock.sendall(data.encode())
     except Exception:
-        pass  # Ignore errors if the connection dropped
+        pass
 
 def send_room_msg(sock, text):
     """Send a text message to everyone in our current room."""
@@ -133,8 +127,10 @@ def leave_room(sock):
 def send_file(sock, target_id, filepath):
     """
     Send a file to a specific device.
-    Step 1: Send a FILE_HEADER message with the filename and size.
-    Step 2: Stream the raw file bytes over TCP in chunks.
+    We encode the file as base64 so it can travel safely inside
+    our JSON protocol without breaking the message framing.
+    Base64 converts binary bytes into plain ASCII text characters,
+    which means the whole file fits neatly inside our JSON payload.
     """
     if not os.path.exists(filepath):
         print(f"[!] File not found: {filepath}")
@@ -143,30 +139,27 @@ def send_file(sock, target_id, filepath):
     filename = os.path.basename(filepath)   # Just the filename, not full path
     filesize = os.path.getsize(filepath)    # Size in bytes
 
-    # Step 1: Announce the file transfer
+    # Read the entire file and encode it as base64 text
+    with open(filepath, "rb") as f:
+        raw_bytes = f.read()
+        encoded = base64.b64encode(raw_bytes).decode("utf-8")
+
+    print(f"[FILE] Sending {filename} ({filesize} bytes) → {target_id}...")
+
+    # Send everything in one JSON message — no raw byte streaming needed
     send_msg(sock, {
         "type":    "FILE_HEADER",
         "sender":  device_id,
         "room":    None,
         "target":  target_id,
-        "payload": {"filename": filename, "size": filesize}
+        "payload": {
+            "filename": filename,
+            "size":     filesize,
+            "data":     encoded   # base64 encoded file content
+        }
     })
 
-    # Step 2: Read and send the file in chunks
-    with open(filepath, "rb") as f:
-        bytes_sent = 0
-        while True:
-            chunk = f.read(BUFFER_SIZE)  # Read up to BUFFER_SIZE bytes
-            if not chunk:
-                break                    # End of file
-            sock.sendall(chunk)          # Send this chunk
-            bytes_sent += len(chunk)
-
-            # Show a progress percentage
-            percent = int(bytes_sent / filesize * 100)
-            print(f"\r[FILE] Sending {filename}... {percent}%", end="")
-
-    print(f"\n[FILE] Done. Sent {filename} ({filesize} bytes) → {target_id}")
+    print(f"[FILE] Done. Sent {filename} to {target_id}")
 
 # ─── Receiving Messages ───────────────────────────────────
 
@@ -185,27 +178,25 @@ def receive_loop(sock):
             data = sock.recv(BUFFER_SIZE).decode()
 
             if not data:
-                # Server closed the connection
                 print("\n[!] Disconnected from server.")
                 break
 
-            buffer += data  # Add new data to our running buffer
+            buffer += data
 
-            # Check if we have any complete messages (ended by '\n')
             while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)  # Take first complete line
+                line, buffer = buffer.split("\n", 1)
 
                 if not line.strip():
-                    continue  # Skip blank lines
+                    continue
 
                 try:
-                    msg = json.loads(line)  # Parse the JSON
-                    display_message(msg)    # Show it to the user
+                    msg = json.loads(line)
+                    display_message(msg)
                 except json.JSONDecodeError:
-                    pass  # Ignore malformed messages
+                    pass
 
         except Exception:
-            break  # Exit loop if the connection breaks
+            break
 
 def display_message(msg):
     """
@@ -226,18 +217,29 @@ def display_message(msg):
         print_help()
 
     elif msg_type in ("BROADCAST", "ROOM", "DIRECT"):
-        # A regular text message — show who sent it and what they said
+        # A regular text message
         print(f"\n[{msg_type}] {sender}: {payload}")
 
     elif msg_type == "FILE_HEADER":
         # Someone is sending us a file
-        print(f"\n[FILE] Incoming from {sender}: {payload}")
+        filename = payload.get("filename", "received_file")
+        size     = payload.get("size", 0)
+        data     = payload.get("data")   # base64 encoded file content
+
+        print(f"\n[FILE] Incoming from {sender}: {filename} ({size} bytes)")
+
+        if data:
+            # Decode base64 back to raw bytes and save to files_received folder
+            os.makedirs("files_received", exist_ok=True)
+            save_path = os.path.join("files_received", filename)
+
+            with open(save_path, "wb") as f:
+                f.write(base64.b64decode(data))
+
+            print(f"[FILE] Saved to: {save_path}")
 
     elif msg_type == "ERROR":
-        # Server is reporting an error
         print(f"\n[ERROR] {payload}")
-
-    # We intentionally ignore ACK echo messages to keep output clean
 
 # ─── Terminal UI ──────────────────────────────────────────
 
@@ -263,7 +265,6 @@ def main():
     server_ip, server_port = discover_server(timeout=3)
 
     if not server_ip:
-        # UDP discovery failed — ask the user to enter the IP manually
         server_ip   = input("Could not find server. Enter IP manually: ").strip()
         server_port = SERVER_PORT
 
@@ -284,10 +285,10 @@ def main():
     # Step 6: Main input loop — read commands from the user
     while True:
         try:
-            user_input = input()  # Wait for user to type something
+            user_input = input()
 
             if not user_input.strip():
-                continue  # Ignore empty input
+                continue
 
             if user_input.startswith("/join "):
                 room_name = user_input[6:].strip()
@@ -301,7 +302,6 @@ def main():
                 send_broadcast_msg(tcp_sock, message)
 
             elif user_input.startswith("/direct "):
-                # Format: /direct <device_id> <message>
                 parts = user_input[8:].split(" ", 1)
                 if len(parts) == 2:
                     send_direct_msg(tcp_sock, parts[0], parts[1])
@@ -313,7 +313,6 @@ def main():
                 send_room_msg(tcp_sock, message)
 
             elif user_input.startswith("/sendfile "):
-                # Format: /sendfile <device_id> <filepath>
                 parts = user_input[10:].split(" ", 1)
                 if len(parts) == 2:
                     send_file(tcp_sock, parts[0], parts[1])
@@ -321,14 +320,13 @@ def main():
                     print("[!] Usage: /sendfile <device_id> <filepath>")
 
             elif user_input == "/quit":
-                break  # Exit the input loop
+                break
 
             else:
-                # No command prefix — treat as a room message
                 send_room_msg(tcp_sock, user_input)
 
         except (KeyboardInterrupt, EOFError):
-            break  # Ctrl+C or Ctrl+D exits cleanly
+            break
 
     tcp_sock.close()
     print("[Lynk] Disconnected. Goodbye!")
