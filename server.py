@@ -69,6 +69,49 @@ def get_local_ip():
     finally:
         temp_sock.close()
 
+
+def broadcast_device_list():
+    """
+    Send the current list of connected device IDs to every client.
+    Called whenever someone connects or disconnects so all clients
+    can keep their device panel up to date.
+    """
+    with lock:
+        device_ids  = list(devices.keys())    # All current device IDs
+        all_sockets = list(devices.values())  # All current sockets
+
+    msg = {
+        "type":    "DEVICE_LIST",
+        "sender":  "server",
+        "room":    None,
+        "target":  None,
+        "payload": device_ids                 # Send the full list
+    }
+    for sock in all_sockets:
+        send_msg(sock, msg)
+
+
+def broadcast_room_list():
+    """
+    Send the current list of known room names to every client.
+    Called whenever someone joins a room so all clients can
+    see available rooms in their panel.
+    """
+    with lock:
+        room_names  = list(rooms.keys())      # All current room names
+        all_sockets = list(devices.values())  # All current sockets
+
+    msg = {
+        "type":    "ROOM_LIST",
+        "sender":  "server",
+        "room":    None,
+        "target":  None,
+        "payload": room_names                 # Send the full list
+    }
+    for sock in all_sockets:
+        send_msg(sock, msg)
+
+
 # ─── Message Routing ──────────────────────────────────────
 
 def route(msg, sender_id):
@@ -142,6 +185,9 @@ def route(msg, sender_id):
 
         print(f"[+] {names.get(sender_id)} joined room '{room_name}'")
 
+        # Tell every client the updated room list
+        broadcast_room_list()
+
         # Notify existing members that someone joined
         join_notice = {
             "type": "ROOM",
@@ -205,6 +251,9 @@ def handle_client(conn, addr):
 
     print(f"[+] {names[device_id]} connected from {addr}")
 
+    # Tell every client (including the new one) the updated device list
+    broadcast_device_list()
+
     # Send the client their assigned device_id
     send_msg(conn, {
         "type": "ACK",
@@ -261,6 +310,9 @@ def handle_client(conn, addr):
 
         print(f"[-] {device_id} disconnected")
         conn.close()
+
+        # Tell remaining clients the updated device list
+        broadcast_device_list()
 
 # ─── UDP Discovery Beacon ─────────────────────────────────
 

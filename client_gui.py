@@ -174,6 +174,7 @@ class LynkApp:
         ).pack(anchor="w", padx=10, pady=(10, 4))
 
         # Listbox showing all connected device IDs
+        # The server sends us the full list whenever someone connects/disconnects
         self.device_listbox = tk.Listbox(
             left_panel,
             bg=PANEL, fg=TEXT,
@@ -439,23 +440,32 @@ class LynkApp:
     def _display_message(self, msg):
         """
         Called on the main thread to display an incoming message.
-        Also updates the device list whenever we see a new sender.
+        Also handles DEVICE_LIST and ROOM_LIST updates from the server.
         """
         msg_type = msg.get("type")
         sender   = msg.get("sender", "unknown")
         payload  = msg.get("payload", "")
-
-        # Any message from a real device (not the server) → add to device list
-        if sender and sender != "server":
-            self._add_device(sender)
 
         if msg_type == "ACK" and sender == "server" and isinstance(payload, dict):
             # Welcome message — server tells us our assigned device ID
             self.device_id = payload.get("device_id", self.device_id)
             self._set_status(f"ID: {self.device_id}")
             self._append_message(f"[Lynk] Connected! Your ID: {self.device_id}\n", "system")
-            # Add ourselves to the device list
-            self._add_device(self.device_id)
+
+        elif msg_type == "DEVICE_LIST":
+            # Server sent us the full current list of connected device IDs
+            # We clear the panel and rebuild it from scratch so it's always accurate
+            self.device_listbox.delete(0, tk.END)        # Remove all existing entries
+            for did in payload:                           # payload is a list of IDs
+                self.device_listbox.insert(tk.END, did)  # Add each one fresh
+
+        elif msg_type == "ROOM_LIST":
+            # Server sent us the full current list of room names
+            # We add any rooms we don't already have shown in the panel
+            existing = self.room_listbox.get(0, tk.END)  # Get what's already listed
+            for room_name in payload:
+                if room_name not in existing:
+                    self.room_listbox.insert(tk.END, room_name)
 
         elif msg_type == "BROADCAST":
             self._append_message(f"[BROADCAST] {sender}: {payload}\n", "broadcast")
@@ -522,7 +532,6 @@ class LynkApp:
         elif text.startswith("/join "):
             room_name = text[6:].strip()
             self._join_room(room_name)
-            # Also update the room entry box to match
             self.room_entry.delete(0, tk.END)
             self.room_entry.insert(0, room_name)
 
@@ -578,8 +587,6 @@ class LynkApp:
                 "room": room_name, "target": None, "payload": None
             })
         self._append_message(f"[Lynk] Joined room: {room_name}\n", "system")
-        # Add to the ROOMS panel
-        self.root.after(0, lambda: self._add_room(room_name))
 
     def _leave_room(self):
         """Tell the server we are leaving the current room."""
@@ -692,12 +699,6 @@ class LynkApp:
         """Update the status label in the top bar. Safe to call from any thread."""
         self.root.after(0, lambda: self.status_var.set(text))
 
-    def _add_device(self, device_id):
-        """Add a device ID to the DEVICES panel if not already listed."""
-        existing = self.device_listbox.get(0, tk.END)   # Get all current entries
-        if device_id not in existing:
-            self.device_listbox.insert(tk.END, device_id)
-
     def _remove_device(self, device_id):
         """Remove a device ID from the DEVICES panel."""
         all_items = self.device_listbox.get(0, tk.END)
@@ -705,12 +706,6 @@ class LynkApp:
             if device_id in item:
                 self.device_listbox.delete(i)   # Delete by index
                 break
-
-    def _add_room(self, room_name):
-        """Add a room name to the ROOMS panel if not already listed."""
-        existing = self.room_listbox.get(0, tk.END)
-        if room_name not in existing:
-            self.room_listbox.insert(tk.END, room_name)
 
 # ─── Entry Point ──────────────────────────────────────────
 
